@@ -5,145 +5,135 @@ import argparse
 from collections import defaultdict
 
 # --- CLI SETUP ---
-parser = argparse.ArgumentParser(description="Joint multi-instrument Markov generator")
-parser.add_argument('--order', type=int, default=2, help='Memory length (order) of the Markov Chain')
-parser.add_argument('--length', type=int, default=100, help='Number of events to generate')
-parser.add_argument('--input', type=str, default='output', help='Base directory for input CSVs')
-parser.add_argument('--output', type=str, default='melodies', help='Base directory for generated files')
+parser = argparse.ArgumentParser(description="Generate melodies using a Markov Chain with full musical events.")
+parser.add_argument('--order', type=int, default=2, help='Memory length (order) of the Markov Chain.')
+parser.add_argument('--length', type=int, default=100, help='Number of events to generate per file.')
+parser.add_argument('--input', type=str, default='output', help='Base directory for input CSVs.')
+parser.add_argument('--output', type=str, default='melodies', help='Base directory for generated files.')
 args = parser.parse_args()
 
 
-# --- HELPER: read a single instrument CSV into a list of events ---
-def read_instrument_csv(csv_path):
-    events = []
+# --- MARKOV CHAIN BUILDER USING FULL MUSICAL EVENTS ---
+
+def build_chain(csv_path, order):
+    chain = defaultdict(list)
+    sequence = []
+
     with open(csv_path, mode='r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
+
+        required_cols = [
+            "Type",
+            "Pitch/Content",
+            "Duration_QuarterNotes",
+            "Beat"
+        ]
+
+        for col in required_cols:
+            if col not in reader.fieldnames:
+                raise ValueError(f"Missing required column '{col}' in {csv_path}")
+
+        # Convert each row into a musical event token
         for row in reader:
             event = (
-                row.get("Type", "Note"),
-                row.get("Pitch/Content", "REST"),
-                float(row.get("Duration_QuarterNotes", 1.0)),
-                float(row.get("Measure", 1)),
-                float(row.get("Beat", 1))
+                row["Type"],                           # Note or Rest
+                row["Pitch/Content"],                  # Pitch name or REST
+                float(row["Duration_QuarterNotes"]),   # Duration
+                float(row["Beat"])                     # Beat position
             )
-            events.append(event)
-    return events
+            sequence.append(event)
+
+    if len(sequence) <= order:
+        return None, []
+
+    # Build transitions
+    for i in range(len(sequence) - order):
+        state = tuple(sequence[i:i + order])
+        next_event = sequence[i + order]
+        chain[state].append(next_event)
+
+    return dict(chain), sequence
 
 
-# --- BUILD JOINT SEQUENCE ACROSS ALL INSTRUMENTS ---
-def build_joint_sequence(instrument_csvs):
-    # instrument_csvs = dict {instrument_name: csv_path}
-    instrument_names = list(instrument_csvs.keys())
-    instrument_events = {name: read_instrument_csv(path) for name, path in instrument_csvs.items()}
+# --- SEQUENCE GENERATOR ---
 
-    # Determine max length
-    max_len = max(len(events) for events in instrument_events.values())
-
-    joint_sequence = []
-    for i in range(max_len):
-        joint_state = []
-        for name in instrument_names:
-            events = instrument_events[name]
-            if i < len(events):
-                joint_state.append(events[i])
-            else:
-                # pad missing instruments with rests
-                joint_state.append(("Rest", "REST", 1.0, 1, 1))
-        joint_sequence.append(tuple(joint_state))
-
-    return joint_sequence, instrument_names
-
-
-# --- BUILD MARKOV CHAIN ---
-def build_joint_chain(joint_sequence, order):
-    chain = defaultdict(list)
-    if len(joint_sequence) <= order:
-        return None
-    for i in range(len(joint_sequence) - order):
-        state = tuple(joint_sequence[i:i+order])
-        next_state = joint_sequence[i + order]
-        chain[state].append(next_state)
-    return dict(chain)
-
-
-# --- GENERATE NEW JOINT SEQUENCE ---
-def generate_joint_sequence(chain, order, length):
+def generate_sequence(chain, all_events, order, length):
     if not chain:
         return ["Insufficient Data"]
 
+    # Start from learned state
     current_state = random.choice(list(chain.keys()))
-    result_sequence = list(current_state)
+    result = list(current_state)
 
-    while len(result_sequence) < length:
+    while len(result) < length:
         options = chain.get(current_state)
+
+        # Dead-end fallback
         if not options:
             current_state = random.choice(list(chain.keys()))
             options = chain[current_state]
-        next_state = random.choice(options)
-        result_sequence.append(next_state)
-        current_state = tuple(result_sequence[-order:])
-    return result_sequence[:length]
+
+        next_event = random.choice(options)
+        result.append(next_event)
+
+        # Slide Markov window
+        current_state = tuple(result[-order:])
+
+    return result[:length]
 
 
-# --- WRITE OUTPUT CSVS PER INSTRUMENT ---
-def write_output_csvs(result_sequence, instrument_names, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-    # Initialize file handles for each instrument
-    writers = {}
-    files = {}
-    for name in instrument_names:
-        file_path = os.path.join(output_dir, f"gen_{name}.csv")
-        f = open(file_path, mode='w', newline='', encoding='utf-8')
-        writer = csv.writer(f)
-        writer.writerow(['Sequence_Step', 'Type', 'Pitch/Content', 'Duration_QuarterNotes', 'Measure', 'Beat'])
-        writers[name] = writer
-        files[name] = f
+# --- MAIN EXECUTION PIPELINE ---
 
-    for idx, joint_state in enumerate(result_sequence):
-        for inst_idx, name in enumerate(instrument_names):
-            event = joint_state[inst_idx]
-            event_type, pitch, duration, measure, beat = event
-            writers[name].writerow([idx, event_type, pitch, duration, measure, beat])
-
-    # Close all files
-    for f in files.values():
-        f.close()
-
-
-# --- MAIN EXECUTION ---
 input_base = args.input
 output_base = args.output
 
+print(f"Running Markov generation with order={args.order}, length={args.length}")
+
 if not os.path.exists(input_base):
     print(f"Error: Input directory '{input_base}' not found.")
-    exit(1)
+else:
+    os.makedirs(output_base, exist_ok=True)
 
-for song_folder in os.listdir(input_base):
-    folder_path = os.path.join(input_base, song_folder)
-    if not os.path.isdir(folder_path):
-        continue
+    for song_folder in os.listdir(input_base):
+        input_path = os.path.join(input_base, song_folder)
 
-    print(f"\nProcessing folder: {song_folder}")
+        if os.path.isdir(input_path):
+            target_dir = os.path.join(output_base, song_folder.replace("_data", "_generated"))
+            os.makedirs(target_dir, exist_ok=True)
 
-    # Map instrument name -> CSV
-    instrument_csvs = {}
-    for csv_file in os.listdir(folder_path):
-        if csv_file.endswith(".csv"):
-            inst_name = os.path.splitext(csv_file)[0]
-            instrument_csvs[inst_name] = os.path.join(folder_path, csv_file)
+            print(f"\nProcessing folder: {song_folder}")
 
-    # Build joint sequence
-    joint_sequence, instrument_names = build_joint_sequence(instrument_csvs)
+            for csv_file in os.listdir(input_path):
+                if csv_file.endswith(".csv"):
+                    file_path = os.path.join(input_path, csv_file)
 
-    # Build joint Markov chain
-    chain = build_joint_chain(joint_sequence, args.order)
-    print(f"Joint chain states learned: {len(chain)}")
+                    chain, full_seq = build_chain(file_path, args.order)
 
-    # Generate new sequence
-    new_sequence = generate_joint_sequence(chain, args.order, args.length)
+                    if chain:
+                        print(f"{csv_file} → states learned: {len(chain)}")
+                    else:
+                        print(f"{csv_file} → insufficient data")
 
-    # Write output CSVs per instrument
-    target_dir = os.path.join(output_base, song_folder + "_generated_joint")
-    write_output_csvs(new_sequence, instrument_names, target_dir)
+                    new_melody = generate_sequence(chain, full_seq, args.order, args.length)
 
-print(f"\nAll generated joint melodies saved in: {output_base}")
+                    # Write generated output
+                    output_file = os.path.join(target_dir, f"gen_{csv_file}")
+                    with open(output_file, mode='w', newline='', encoding='utf-8') as f:
+                        writer = csv.writer(f)
+                        writer.writerow([
+                            'Sequence_Step',
+                            'Type',
+                            'Pitch/Content',
+                            'Duration_QuarterNotes',
+                            'Beat'
+                        ])
+
+                        for idx, event in enumerate(new_melody):
+                            if event == "Insufficient Data":
+                                writer.writerow([idx, "", "", "", ""])
+                                continue
+
+                            event_type, pitch, duration, beat = event
+                            writer.writerow([idx, event_type, pitch, duration, beat])
+
+    print(f"\nAll generated melodies saved in: {output_base}")
